@@ -1,0 +1,666 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface, ThemeKey } from 'claude-code'
+
+import type {
+  TrajectoryKind,
+  TrajectoryMeta,
+  TrajectoryMode,
+  TrajectoryRow,
+  TrajectoryStep,
+} from '../types'
+
+const PANE = 'trajectory'
+const MAX_ROWS = 1000
+const MAX_TEXT = 20_000
+// A drawn tree shows its first 100,000 characters: leave room around the prompt.
+const MAX_SYSTEM_TEXT = 80_000
+// Header, search, minimap with its margins, divider and footer.
+const CHROME_ROWS = 10
+const GUTTER = 7
+const BADGE = 10
+const MINIMAP_LABEL = 7
+const MARK = '⣿'
+
+const rows = atom({ plugin: 'trajectory', key: 'rows' } as const, [] as TrajectoryRow[])
+const steps = atom({ plugin: 'trajectory', key: 'steps' } as const, [] as TrajectoryStep[])
+const meta = atom({ plugin: 'trajectory', key: 'meta' } as const, {
+  startAt: 0,
+  turns: 0,
+  turnStartAt: 0,
+} as TrajectoryMeta)
+const mode = atom({ plugin: 'trajectory', key: 'mode' } as const, 'calls' as TrajectoryMode)
+const query = atom({ plugin: 'trajectory', key: 'query' } as const, '')
+const selected = atom({ plugin: 'trajectory', key: 'selected' } as const, '')
+const listTop = atom({ plugin: 'trajectory', key: 'listTop' } as const, -1)
+const detailTop = atom({ plugin: 'trajectory', key: 'detailTop' } as const, 0)
+
+const COLORS: Record<TrajectoryKind, ThemeKey> = {
+  system: 'inactive',
+  user: 'suggestion',
+  context: 'success',
+  assistant: 'merged',
+  thinking: 'subtle',
+  tool: 'warning',
+}
+
+type Block = { type: string; [field: string]: unknown }
+
+const clip = (text: string, max = MAX_TEXT) =>
+  text.length > max ? `${text.slice(0, max)}… (${text.length - max} more chars)` : text
+
+const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+// East Asian wide characters take two cells in a terminal.
+const cellsOf = (char: string) => {
+  const c = char.codePointAt(0) ?? 0
+  const isWide =
+    (c >= 0x1100 && c <= 0x115f) ||
+    (c >= 0x2e80 && c <= 0xa4cf) ||
+    (c >= 0xac00 && c <= 0xd7a3) ||
+    (c >= 0xf900 && c <= 0xfaff) ||
+    (c >= 0xfe30 && c <= 0xfe4f) ||
+    (c >= 0xff00 && c <= 0xff60) ||
+    (c >= 0xffe0 && c <= 0xffe6) ||
+    (c >= 0x1f300 && c <= 0x1faff) ||
+    c >= 0x20000
+
+  return isWide ? 2 : 1
+}
+
+const fit = (text: string, width: number) => {
+  if (width <= 0) return ''
+  let used = 0
+  let out = ''
+  for (const char of text) {
+    const cells = cellsOf(char)
+    if (used + cells > width - 1) {
+      const rest = [...text].slice([...out].length)
+      if (rest.reduce((n, c) => n + cellsOf(c), 0) + used <= width) return out + rest.join('')
+
+      return `${out}…`
+    }
+    out += char
+    used += cells
+  }
+
+  return out
+}
+
+const textOf = (content: unknown): string => {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  return content
+    .map(block => {
+      const b = block as Block
+      if (b.type === 'text') return String(b.text ?? '')
+      if (b.type === 'image') return '[image]'
+      if (b.type === 'document') return '[document]'
+
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+const formatTokens = (n: number) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
+
+const formatMs = (ms: number) =>
+  ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m` : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`
+
+const systemRow = (at: number): TrajectoryRow => ({
+  id: 'system',
+  kind: 'system',
+  turn: 0,
+  at,
+  text: 'Initial System Prompt',
+})
+
+async function push($: EngineInterface, added: TrajectoryRow[]) {
+  if (added.length === 0) return
+  await update($, rows, list => [...list, ...added].slice(-MAX_ROWS))
+}
+
+async function reset($: EngineInterface) {
+  const now = await $.clock.now()
+  await update($, rows, () => [systemRow(now)])
+  await update($, steps, () => [])
+  await update($, meta, () => ({ startAt: now, turns: 0, turnStartAt: now }))
+  await update($, selected, () => '')
+  await update($, listTop, () => -1)
+  await update($, detailTop, () => 0)
+}
+
+function matchesOf(list: TrajectoryRow[], q: string) {
+  const needle = q.trim().toLowerCase()
+  if (!needle) return list
+
+  return list.filter(row =>
+    [row.kind, row.tool ?? '', row.text, row.result ?? ''].some(s => s.toLowerCase().includes(needle)),
+  )
+}
+
+// Breaks text into lines of at most `width` cells, keeping its own newlines.
+function wrapLines(text: string, width: number) {
+  const out: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    let used = 0
+    for (const char of para.replace(/\t/g, '  ')) {
+      const cells = cellsOf(char)
+      if (used + cells > width) {
+        out.push(line)
+        line = ''
+        used = 0
+      }
+      line += char
+      used += cells
+    }
+    out.push(line)
+  }
+
+  return out
+}
+
+const topOf = (top: number, count: number, room: number) =>
+  top < 0 ? Math.max(0, count - room) : Math.min(top, Math.max(0, count - room))
+
+async function moveSelection($: EngineInterface, delta: number, room: number) {
+  const [list, q, current, top] = await Promise.all([read($, rows), read($, query), read($, selected), read($, listTop)])
+  const matches = matchesOf(list, q)
+  if (matches.length === 0) return
+  const at = matches.findIndex(row => row.id === current)
+  const index = at < 0 ? matches.length - 1 : Math.min(matches.length - 1, Math.max(0, at + delta))
+  const shownTop = topOf(top, matches.length, room)
+  const nextTop = index < shownTop ? index : index >= shownTop + room ? index - room + 1 : shownTop
+  await update($, selected, () => matches[index]?.id ?? '')
+  await update($, detailTop, () => 0)
+  await update($, listTop, () => (nextTop >= matches.length - room ? -1 : nextTop))
+}
+
+async function scrollList($: EngineInterface, delta: number, room: number) {
+  const [list, q, top] = await Promise.all([read($, rows), read($, query), read($, listTop)])
+  const count = matchesOf(list, q).length
+  const next = Math.max(0, topOf(top, count, room) + delta)
+  await update($, listTop, () => (next >= count - room ? -1 : next))
+}
+
+// What the copy key puts on the clipboard: the row as the detail half shows it.
+const copyTextOf = (row: TrajectoryRow) => {
+  const head = row.tool ? `${row.tool} ${row.text}` : row.text
+
+  return row.result !== undefined ? `${head}\n\n→ ${row.result}` : head
+}
+
+async function copyRow($: EngineInterface, row: TrajectoryRow, surface: RenderSurface) {
+  const text = copyTextOf(row)
+  const copied = await $.ui.copy({ text, surface })
+  await $.ui.toast(
+    copied.isCopied
+      ? `Copied ${row.kind.toUpperCase()} (${formatTokens(text.length)} chars)`
+      : `Could not copy: ${copied.reason}`,
+  )
+}
+
+// A local estimate, as no token-count API reaches a mod: about four ASCII
+// characters to a token, and about one token for each other character.
+const estimateTokens = (text: string) => {
+  let ascii = 0
+  let other = 0
+  for (const char of text) {
+    if ((char.codePointAt(0) ?? 0) < 0x80) ascii++
+    else other++
+  }
+
+  return Math.ceil(ascii / 4 + other)
+}
+
+const clockOf = (ms: number) => {
+  const d = new Date(ms)
+
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'trajectory',
+      description: 'Show the trajectory of this session (every prompt, context, reply and tool call) in a pane',
+    })
+    // A reload runs session.start again: keep what the session already recorded.
+    if ((await read($, rows)).length === 0) await reset($)
+
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') await reset($)
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'trajectory' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Trajectory' })
+
+    return { text: 'Trajectory pane opened.' }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    const list = await read($, rows)
+    const system = list.find(row => row.id === 'system')
+    if (system && system.title === undefined) {
+      const chars = composed.sections.reduce((n, s) => n + s.text.length, 0)
+      const body = composed.sections.map(s => `## ${s.id} (${s.scope})\n${s.text}`).join('\n\n')
+      await update($, rows, all =>
+        all.map(row =>
+          row.id === 'system'
+            ? {
+                ...row,
+                title: `Initial System Prompt · ${composed.sections.length} sections · ${formatTokens(chars)} chars · ${e.model}`,
+                text: clip(body, MAX_SYSTEM_TEXT),
+                result: undefined,
+              }
+            : row,
+        ),
+      )
+    }
+
+    return composed
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      const now = await $.clock.now()
+      await update($, meta, m => ({ ...m, turns: m.turns + 1, turnStartAt: now }))
+    }
+
+    return next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e)
+
+    const { turns } = await read($, meta)
+    const startAt = await $.clock.now()
+    const step: TrajectoryStep = {
+      turn: turns,
+      startAt,
+      model: e.model,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    }
+    await update($, steps, list => [...list, step].slice(-MAX_ROWS))
+
+    const result = yield* next(e)
+
+    const endAt = await $.clock.now()
+    const usage = result.usage
+    await update($, steps, list =>
+      list.map(one =>
+        one.startAt === startAt && one.turn === turns
+          ? {
+              ...one,
+              endAt,
+              model: usage?.model ?? one.model,
+              input: usage?.input_tokens ?? 0,
+              output: usage?.output_tokens ?? 0,
+              cacheRead: usage?.cache_read_input_tokens ?? 0,
+              cacheWrite: usage?.cache_creation_input_tokens ?? 0,
+            }
+          : one,
+      ),
+    )
+
+    return result
+  })
+
+  on('session.append', async ($, e, next) => {
+    const stored = await next(e)
+    if (e.agentId !== undefined || e.door === 'queue' || stored.deny !== undefined) return stored
+
+    const { message } = stored
+    const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
+    const base = { turn: turns, at }
+    const blocks = message.content as Block[]
+
+    if (e.door === 'tool-result') {
+      const results = blocks.filter(b => b.type === 'tool_result')
+      if (results.length > 0) {
+        const byId = new Map(results.map(b => [String(b.tool_use_id), b]))
+        await update($, rows, list =>
+          list.map(row => {
+            const b = byId.get(row.id)
+            if (!b) return row
+
+            return {
+              ...row,
+              endAt: row.endAt ?? at,
+              result: clip(textOf(b.content)),
+              isError: b.is_error === true,
+            }
+          }),
+        )
+
+        return stored
+      }
+    }
+
+    if (message.type === 'assistant') {
+      const added: TrajectoryRow[] = []
+      blocks.forEach((b, i) => {
+        if (b.type === 'text' && String(b.text ?? '').trim() !== '') {
+          added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'assistant', text: clip(String(b.text)) })
+        } else if (b.type === 'thinking' && String(b.thinking ?? '').trim() !== '') {
+          added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'thinking', text: clip(String(b.thinking)) })
+        } else if (b.type === 'tool_use') {
+          added.push({
+            ...base,
+            id: String(b.id),
+            kind: 'tool',
+            tool: String(b.name),
+            text: clip(JSON.stringify(b.input ?? {})),
+          })
+        }
+      })
+      await push($, added)
+
+      return stored
+    }
+
+    const text = textOf(message.content)
+    if (text.trim() === '') return stored
+
+    const isUser = (e.door === 'prompt' || e.door === 'command') && message.isMeta !== true
+    const kind: TrajectoryKind = isUser
+      ? 'user'
+      : e.door === 'notice' || e.door === 'compaction'
+        ? 'system'
+        : 'context'
+    const label = message.name && !isUser ? `[${message.name}] ` : ''
+    await push($, [{ ...base, id: stored.uuid, kind, text: clip(label + text) }])
+
+    return stored
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const startAt = await $.clock.now()
+    await update($, rows, list => list.map(row => (row.id === e.tool_use_id ? { ...row, at: startAt } : row)))
+    const ran = await next(e)
+    const endAt = await $.clock.now()
+    await update($, rows, list => list.map(row => (row.id === e.tool_use_id ? { ...row, endAt } : row)))
+
+    return ran
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
+    // Mobile draws no text field: search is left out there.
+    const Input = 'Input' in elements ? elements.Input : undefined
+    const [list, stepList, m, currentMode, q, current, top, lineTop, now] = await Promise.all([
+      read($, rows),
+      read($, steps),
+      read($, meta),
+      read($, mode),
+      read($, query),
+      read($, selected),
+      read($, listTop),
+      read($, detailTop),
+      $.clock.now(),
+    ])
+    const width = Math.max(40, e.props.bodyColumns)
+
+    // Minimap: each lane is a row of cells, each cell the color of what sits there.
+    const lanes = { Input: [] as (ThemeKey | undefined)[], Model: [] as (ThemeKey | undefined)[], Tools: [] as (ThemeKey | undefined)[] }
+    const cols = Math.max(10, width - MINIMAP_LABEL)
+    for (const lane of Object.values(lanes)) lane.length = cols
+    const laneOf = (kind: TrajectoryKind) =>
+      kind === 'tool' ? lanes.Tools : kind === 'assistant' || kind === 'thinking' ? lanes.Model : lanes.Input
+    const paint = (lane: (ThemeKey | undefined)[], from: number, to: number, color: ThemeKey) => {
+      const a = Math.min(cols - 1, Math.max(0, Math.floor(from * cols)))
+      const b = Math.min(cols - 1, Math.max(a, Math.ceil(to * cols) - 1))
+      for (let i = a; i <= b; i++) lane[i] = color
+    }
+
+    if (currentMode === 'duration') {
+      const span = Math.max(1, now - m.startAt)
+      const x = (t: number) => (t - m.startAt) / span
+      for (const row of list) {
+        if (row.kind === 'assistant' || row.kind === 'thinking') continue
+        paint(laneOf(row.kind), x(row.at), x(row.endAt ?? row.at), COLORS[row.kind])
+      }
+      for (const step of stepList) paint(lanes.Model, x(step.startAt), x(step.endAt ?? now), COLORS.assistant)
+    } else if (currentMode === 'turns') {
+      const buckets = m.turns + 1
+      const perTurn = new Map<number, TrajectoryRow[]>()
+      for (const row of list) perTurn.set(row.turn, [...(perTurn.get(row.turn) ?? []), row])
+      for (const [turn, inTurn] of perTurn) {
+        inTurn.forEach((row, j) => {
+          const from = (turn + j / inTurn.length) / buckets
+          paint(laneOf(row.kind), from, from + 0.5 / (buckets * inTurn.length), COLORS[row.kind])
+        })
+      }
+    } else {
+      // Calls: one slot per row, with a gap between slots when there is room.
+      const slot = cols / Math.max(1, list.length)
+      list.forEach((row, i) => {
+        const from = (i * slot) / cols
+        paint(laneOf(row.kind), from, from + Math.max(1, slot - 1) / cols, COLORS[row.kind])
+      })
+    }
+
+    const drawLane = (name: string, lane: (ThemeKey | undefined)[]) => {
+      const runs: { color?: ThemeKey; text: string }[] = []
+      for (const color of lane) {
+        const last = runs[runs.length - 1]
+        const char = color ? MARK : ' '
+        if (last && last.color === color) last.text += char
+        else runs.push({ color, text: char })
+      }
+
+      return (
+        <Box key={`lane-${name}`} flexDirection="row">
+          <Text dimColor>{name.padEnd(MINIMAP_LABEL)}</Text>
+          {runs.map(run => (run.color ? <Text color={run.color}>{run.text}</Text> : <Text>{run.text}</Text>))}
+        </Box>
+      )
+    }
+
+    // The body splits in two: the list of rows above, the selected row's detail below.
+    const room = Math.max(6, (e.props.scroll?.bodyRows ?? 30) - CHROME_ROWS)
+    const listRows = Math.ceil(room / 2)
+    const detailRows = room - listRows
+
+    const needle = q.trim().toLowerCase()
+    const matches = matchesOf(list, q)
+    const shownTop = topOf(top, matches.length, listRows)
+    const shown = matches.slice(shownTop, shownTop + listRows)
+    const textWidth = width - GUTTER - BADGE - 1
+
+    const summaryOf = (row: TrajectoryRow) => {
+      if (row.title !== undefined) return row.title
+      if (row.kind !== 'tool') return oneLine(row.text)
+      const input = fit(oneLine(row.text), Math.max(12, Math.floor(textWidth / 3)))
+      const took = row.endAt !== undefined ? ` ${formatMs(row.endAt - row.at)}` : ' …'
+      const result = row.result !== undefined ? ` → ${oneLine(row.result)}` : ''
+
+      return `${row.tool} ${input}${took}${result}`
+    }
+    const badgeOf = (row: TrajectoryRow) => (row.kind === 'tool' && row.isError ? 'TOOL ✗' : row.kind.toUpperCase())
+    const colorOf = (row: TrajectoryRow): ThemeKey => (row.kind === 'tool' && row.isError ? 'error' : COLORS[row.kind])
+
+    let lastTurn = shownTop > 0 ? (matches[shownTop - 1]?.turn ?? -1) : -1
+    const lines = shown.map(row => {
+      const gutter = row.turn !== lastTurn && row.turn > 0 ? `Turn ${row.turn}` : ''
+      lastTurn = row.turn
+      const isSelected = current === row.id
+
+      return (
+        <Button
+          key={`press-${row.id}`}
+          plain
+          onPress={async () => {
+            await update($, selected, was => (was === row.id ? '' : row.id))
+            await update($, detailTop, () => 0)
+          }}
+        >
+          <Text dimColor>{(isSelected ? '▶' : gutter).padEnd(GUTTER)}</Text>
+          <Text color={colorOf(row)} bold>
+            {badgeOf(row).padStart(BADGE - 1)}
+          </Text>{' '}
+          <Text dimColor={row.kind === 'thinking'} inverse={isSelected}>
+            {fit(summaryOf(row), textWidth)}
+          </Text>
+        </Button>
+      )
+    })
+    const listFiller = Array.from({ length: listRows - lines.length }, () => <Text> </Text>)
+
+    // Detail: the selected row whole, wrapped to the pane and windowed.
+    const picked = matches.find(row => row.id === current) ?? list.find(row => row.id === current)
+    const bodyWidth = Math.max(10, width - 1)
+    const detail: { text: string; tone?: 'result' | 'error' }[] = []
+    if (picked) {
+      for (const text of wrapLines(picked.text, bodyWidth)) detail.push({ text })
+      if (picked.result !== undefined) {
+        detail.push({ text: '' })
+        const tone = picked.isError ? 'error' : 'result'
+        for (const text of wrapLines(`→ ${picked.result}`, bodyWidth)) detail.push({ text, tone })
+      }
+    }
+    const maxLineTop = Math.max(0, detail.length - detailRows)
+    const firstLine = Math.min(lineTop, maxLineTop)
+    const detailShown = detail.slice(firstLine, firstLine + detailRows)
+    const pickedInfo = picked
+      ? [
+          picked.tool,
+          picked.turn > 0 ? `Turn ${picked.turn}` : '',
+          clockOf(picked.at),
+          picked.endAt !== undefined ? formatMs(picked.endAt - picked.at) : '',
+          detail.length > detailRows
+            ? `${firstLine + 1}-${firstLine + detailShown.length}/${detail.length} lines`
+            : `${detail.length} lines`,
+          `≈${formatTokens(estimateTokens(picked.text + (picked.result ?? '')))} tok`,
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : 'Select a row to see it whole here'
+    const detailFiller = Array.from({ length: detailRows - detailShown.length }, () => <Text> </Text>)
+    const scrollDetail = (delta: number) =>
+      update($, detailTop, t => Math.min(maxLineTop, Math.max(0, Math.min(t, maxLineTop) + delta)))
+
+    // Footer: what the session cost, as the steps report it.
+    const tokens = stepList.reduce((n, s) => n + s.input + s.output + s.cacheRead + s.cacheWrite, 0)
+    const inputSide = stepList.reduce((n, s) => n + s.input + s.cacheRead + s.cacheWrite, 0)
+    const cacheRead = stepList.reduce((n, s) => n + s.cacheRead, 0)
+    const output = stepList.reduce((n, s) => n + s.output, 0)
+    const modelMs = stepList.reduce((n, s) => n + (s.endAt !== undefined ? s.endAt - s.startAt : 0), 0)
+    const toolCalls = list.filter(row => row.kind === 'tool').length
+    const footer = [
+      `${m.turns} turns`,
+      `${stepList.length} steps`,
+      `${toolCalls} calls`,
+      modelMs > 0 ? `${Math.round(output / (modelMs / 1000))} tok/s` : '',
+      `${formatTokens(tokens)} tok`,
+      inputSide > 0 ? `cache hit ${Math.round((cacheRead / inputSide) * 100)}%` : '',
+      formatMs(now - m.startAt),
+    ]
+      .filter(Boolean)
+      .join(' · ')
+
+    const modeButton = (value: TrajectoryMode, label: string, hotkey: string) => (
+      <Button key={`mode-${value}`} plain hotkey={hotkey} onPress={() => update($, mode, () => value)}>
+        <Text bold={currentMode === value} color={currentMode === value ? 'suggestion' : undefined} dimColor={currentMode !== value}>
+          {label}
+        </Text>
+      </Button>
+    )
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" gap={2}>
+          {modeButton('duration', 'Duration', 'd')}
+          {modeButton('turns', 'Turns', 't')}
+          {modeButton('calls', 'Calls', 'c')}
+          <Text dimColor>
+            {needle ? `${matches.length}/${list.length}` : `${list.length}`} rows
+          </Text>
+          <Box flexGrow={1} />
+          {shownTop > 0 && (
+            <Button key="list-up" plain onPress={() => scrollList($, -(listRows - 1), listRows)}>
+              <Text dimColor>▲ {shownTop} earlier</Text>
+            </Button>
+          )}
+          {top >= 0 && (
+            <Button key="list-latest" plain hotkey="g" onPress={() => scrollList($, matches.length, listRows)}>
+              <Text dimColor>latest ▼</Text>
+            </Button>
+          )}
+        </Box>
+        {Input && (
+          <Input
+            key="search"
+            placeholder="Search"
+            value={q}
+            onInput={(value: string) => update($, query, () => value)}
+            onSubmit={(value: string) => update($, query, () => value)}
+          />
+        )}
+        <Box flexDirection="column" marginY={1}>
+          {drawLane('Input', lanes.Input)}
+          {drawLane('Model', lanes.Model)}
+          {drawLane('Tools', lanes.Tools)}
+        </Box>
+        <Box key="list" flexDirection="column">
+          {shown.length === 0 && <Text dimColor>{needle ? 'No rows match.' : 'Nothing recorded yet.'}</Text>}
+          {lines}
+          {listFiller}
+        </Box>
+        <Box key="divider" flexDirection="row" gap={1}>
+          {picked && (
+            <Text color={colorOf(picked)} bold>
+              {badgeOf(picked)}
+            </Text>
+          )}
+          <Text dimColor>{pickedInfo}</Text>
+          <Box flexGrow={1} />
+          {picked && (
+            <Button key="copy" plain hotkey="y" onPress={press => copyRow($, picked, press.surface)}>
+              <Text dimColor>copy</Text>
+            </Button>
+          )}
+          <Button key="prev" plain hotkey="k" onPress={() => moveSelection($, -1, listRows)}>
+            <Text dimColor>prev</Text>
+          </Button>
+          <Button key="next" plain hotkey="j" onPress={() => moveSelection($, 1, listRows)}>
+            <Text dimColor>next</Text>
+          </Button>
+          <Button key="detail-up" plain hotkey="p" onPress={() => scrollDetail(-(detailRows - 1))}>
+            <Text dimColor>▲</Text>
+          </Button>
+          <Button key="detail-down" plain hotkey="n" onPress={() => scrollDetail(detailRows - 1)}>
+            <Text dimColor>▼</Text>
+          </Button>
+        </Box>
+        <Box key="detail" flexDirection="column">
+          {detailShown.map(line => (
+            <Text
+              color={line.tone === 'error' ? 'error' : undefined}
+              dimColor={line.tone === 'result'}
+            >
+              {line.text === '' ? ' ' : line.text}
+            </Text>
+          ))}
+          {detailFiller}
+        </Box>
+        <Box>
+          <Text dimColor>{footer}</Text>
+        </Box>
+      </Box>
+    )
+  })
+}

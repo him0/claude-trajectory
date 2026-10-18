@@ -1,0 +1,11 @@
+{
+  "name": "claude-trajectory",
+  "owner": { "name": "him0" },
+  "plugins": [
+    {
+      "name": "trajectory",
+      "source": "./",
+      "description": "A Hermes-style trajectory pane: every system, user, context, assistant and tool row of the session on one timeline, with a minimap, search and a detail view"
+    }
+  ]
+}
