@@ -159,3 +159,71 @@ test('y copies the selected row, its result included', async ($, on) => {
   expect(copied).toEqual(['Bash {"command":"ls -la"}\n\n→ package.json'])
   await ui.unmount()
 })
+
+test('each row shows its role, and r filters by it', async ($, on) => {
+  bottoms(on)
+  await playOneTurn($)
+  await $.session.append({
+    door: 'notice',
+    origin: { kind: 'composer' },
+    uuid: 'u5',
+    message: { type: 'system', name: 'away_summary', content: [{ type: 'text', text: 'While you were away…' }] },
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^asst/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^— / })).toBeDefined()
+
+  await ui.press({ key: 'press-u5' })
+  expect(await ui.find({ type: 'Text', text: /not sent to the model · notice:away_summary/ })).toBeDefined()
+  await ui.press({ key: 'press-u2' })
+  expect(await ui.find({ type: 'Text', text: /role: user · attachment:nested_memory/ })).toBeDefined()
+
+  for (const [role, count] of [['system', 1], ['user', 2], ['assistant', 2], ['none', 1], ['all', 6]] as const) {
+    await ui.press({ key: 'role-filter' })
+    expect(await ui.find({ type: 'Text', text: `role: ${role}` })).toBeDefined()
+    expect(await ui.find({ text: new RegExp(`^${count === 6 ? '' : `${count}/`}6 rows$`) })).toBeDefined()
+  }
+  await ui.unmount()
+})
+
+test('the wheel scrolls the list over the list and the detail over the detail', async ($, on) => {
+  bottoms(on)
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 40; i++) {
+    await $.session.append({
+      door: 'prompt',
+      origin: { kind: 'composer' },
+      uuid: `p${i}`,
+      message: {
+        type: 'user',
+        role: 'user',
+        content: [{ type: 'text', text: Array.from({ length: 30 }, (_, n) => `prompt ${i} line ${n}`).join('\n') }],
+      },
+    })
+  }
+
+  // bodyRows 40: 15 list rows (41 rows, so 26 earlier), 15 detail rows from row 23.
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const wheel = (by: number, row: number) =>
+    $.ui.scroll({
+      component: 'Pane',
+      requestId: 'trajectory',
+      offset: 0,
+      by,
+      bodyRows: 40,
+      contentRows: 39,
+      origin: { kind: 'person' },
+      pointer: { column: 10, row },
+    })
+  expect(await ui.find({ text: /▲ 26 earlier/ })).toBeDefined()
+  await wheel(-1, 10)
+  expect(await ui.find({ text: /▲ 23 earlier/ })).toBeDefined()
+
+  await ui.press({ key: 'press-p30' })
+  expect(await ui.find({ text: /1-15\/30 lines/ })).toBeDefined()
+  await wheel(1, 25)
+  expect(await ui.find({ text: /4-18\/30 lines/ })).toBeDefined()
+  expect(await ui.find({ text: /▲ 23 earlier/ })).toBeDefined()
+  await ui.unmount()
+})

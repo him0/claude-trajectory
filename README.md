@@ -3,14 +3,15 @@
 A Claude Code mod that shows the trajectory of a session in a pane, in the style of DeepSeek Hermes' Trajectory view: every system prompt, user prompt, injected context, assistant reply, thinking block and tool call on one timeline.
 
 ```
-Duration  Turns  Calls   42 rows                  ▲ 12 earlier  latest ▼
+Duration  Turns  Calls  role: all   42 rows      ▲ 12 earlier  latest ▼
 [Search                                                      ]
 Input  ⣿⣿ ⣿    ⣿
 Model    ⣿⣿ ⣿⣿ ⣿⣿
 Tools      ⣿⣿⣿ ⣿⣿⣿⣿
-Turn 2   ASSISTANT Let me list the config files first.
-▶             TOOL Bash {"command":"ls -la"} 1.2s → package.json
-TOOL Bash · Turn 2 · 01:12:03 · 1.2s · 3 lines · ≈8 tok   y: copy  k: prev  j: next  p: ▲  n: ▼
+Turn 2   ASSISTANT asst Let me list the config files first.
+           CONTEXT user [nested_memory] <system-reminder>…
+▶             TOOL asst Bash {"command":"ls -la"} 1.2s → package.json
+TOOL Bash · role: assistant · response · Turn 2 · 01:12:03 · 1.2s · 3 lines · ≈8 tok   y: copy  k: prev  j: next  p: ▲  n: ▼
 {"command":"ls -la"}
 
 → package.json
@@ -39,10 +40,12 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Run `/trajectory` to open the pane.
 
-- **Top half**: one row per event, with a colored badge (`SYSTEM`, `USER`, `CONTEXT`, `ASSISTANT`, `THINKING`, `TOOL`). Tool rows show the input, how long the call took and its result.
+- **Top half**: one row per event, with a colored badge (`SYSTEM`, `USER`, `CONTEXT`, `ASSISTANT`, `THINKING`, `TOOL`) and the role a request carries it under (`sys`, `user`, `asst`, or `—` for a row the model never reads, drawn dim). Tool rows show the input, how long the call took and its result.
 - **Minimap**: Input / Model / Tools lanes, laid out by **Duration** (`d`, wall-clock), **Turns** (`t`) or **Calls** (`c`, one slot per row).
 - **Search**: filters rows by kind, tool name, text or result.
-- **Bottom half**: click a row to read it whole: the system prompt's sections, a full prompt, a tool call's input and result. The header shows its turn, time, duration, line count and an estimated token count.
+- **Role filter**: `role: all` cycles through `system`, `user`, `assistant` and `none` (not sent to the model).
+- **Bottom half**: click a row to read it whole: the system prompt's sections, a full prompt, a tool call's input and result. The header shows its role (or that it is not sent to the model), the door it came in by, its turn, time, duration, line count and an estimated token count.
+- **Mouse wheel**: scrolls the list over the top half and the detail over the bottom half.
 
 Keys, once the pane has focus (`ctrl+x tab`):
 
@@ -52,6 +55,7 @@ Keys, once the pane has focus (`ctrl+x tab`):
 | `p` / `n` | scroll the detail up / down |
 | `g` | back to the newest rows |
 | `y` | copy the selected row to the clipboard |
+| `r` | cycle the role filter |
 | `d` / `t` / `c` | minimap by duration / turns / calls |
 
 ## Notes

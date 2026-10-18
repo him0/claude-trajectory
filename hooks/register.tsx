@@ -5,6 +5,8 @@ import type {
   TrajectoryKind,
   TrajectoryMeta,
   TrajectoryMode,
+  TrajectoryRole,
+  TrajectoryRoleFilter,
   TrajectoryRow,
   TrajectoryStep,
 } from '../types'
@@ -30,6 +32,7 @@ const meta = atom({ plugin: 'trajectory', key: 'meta' } as const, {
 } as TrajectoryMeta)
 const mode = atom({ plugin: 'trajectory', key: 'mode' } as const, 'calls' as TrajectoryMode)
 const query = atom({ plugin: 'trajectory', key: 'query' } as const, '')
+const roleFilter = atom({ plugin: 'trajectory', key: 'roleFilter' } as const, 'all' as TrajectoryRoleFilter)
 const selected = atom({ plugin: 'trajectory', key: 'selected' } as const, '')
 const listTop = atom({ plugin: 'trajectory', key: 'listTop' } as const, -1)
 const detailTop = atom({ plugin: 'trajectory', key: 'detailTop' } as const, 0)
@@ -42,6 +45,11 @@ const COLORS: Record<TrajectoryKind, ThemeKey> = {
   thinking: 'subtle',
   tool: 'warning',
 }
+
+const ROLE_FILTERS: TrajectoryRoleFilter[] = ['all', 'system', 'user', 'assistant', 'none']
+const ROLE_WIDTH = 5
+const roleLabelOf = (role: TrajectoryRole | undefined) =>
+  role === 'system' ? 'sys' : role === 'user' ? 'user' : role === 'assistant' ? 'asst' : role === 'none' ? '—' : '?'
 
 type Block = { type: string; [field: string]: unknown }
 
@@ -112,6 +120,7 @@ const formatMs = (ms: number) =>
 const systemRow = (at: number): TrajectoryRow => ({
   id: 'system',
   kind: 'system',
+  role: 'system',
   turn: 0,
   at,
   text: 'Initial System Prompt',
@@ -132,11 +141,12 @@ async function reset($: EngineInterface) {
   await update($, detailTop, () => 0)
 }
 
-function matchesOf(list: TrajectoryRow[], q: string) {
+function matchesOf(list: TrajectoryRow[], q: string, role: TrajectoryRoleFilter) {
   const needle = q.trim().toLowerCase()
-  if (!needle) return list
+  const byRole = role === 'all' ? list : list.filter(row => row.role === role)
+  if (!needle) return byRole
 
-  return list.filter(row =>
+  return byRole.filter(row =>
     [row.kind, row.tool ?? '', row.text, row.result ?? ''].some(s => s.toLowerCase().includes(needle)),
   )
 }
@@ -167,8 +177,14 @@ const topOf = (top: number, count: number, room: number) =>
   top < 0 ? Math.max(0, count - room) : Math.min(top, Math.max(0, count - room))
 
 async function moveSelection($: EngineInterface, delta: number, room: number) {
-  const [list, q, current, top] = await Promise.all([read($, rows), read($, query), read($, selected), read($, listTop)])
-  const matches = matchesOf(list, q)
+  const [list, q, role, current, top] = await Promise.all([
+    read($, rows),
+    read($, query),
+    read($, roleFilter),
+    read($, selected),
+    read($, listTop),
+  ])
+  const matches = matchesOf(list, q, role)
   if (matches.length === 0) return
   const at = matches.findIndex(row => row.id === current)
   const index = at < 0 ? matches.length - 1 : Math.min(matches.length - 1, Math.max(0, at + delta))
@@ -179,11 +195,27 @@ async function moveSelection($: EngineInterface, delta: number, room: number) {
   await update($, listTop, () => (nextTop >= matches.length - room ? -1 : nextTop))
 }
 
+// Rows a wheel tick moves the list or the detail.
+const WHEEL_STEP = 3
+
+// The halves' sizes as last drawn, for the wheel to tell which one it is over.
+// Only a hint: a reload starts it over and the next draw sets it again.
+let drawn = { listRows: 0, detailRows: 0, maxLineTop: 0 }
+
+async function scrollDetail($: EngineInterface, delta: number, maxLineTop: number) {
+  await update($, detailTop, t => Math.min(maxLineTop, Math.max(0, Math.min(t, maxLineTop) + delta)))
+}
+
 async function scrollList($: EngineInterface, delta: number, room: number) {
-  const [list, q, top] = await Promise.all([read($, rows), read($, query), read($, listTop)])
-  const count = matchesOf(list, q).length
+  const [list, q, role, top] = await Promise.all([read($, rows), read($, query), read($, roleFilter), read($, listTop)])
+  const count = matchesOf(list, q, role).length
   const next = Math.max(0, topOf(top, count, room) + delta)
   await update($, listTop, () => (next >= count - room ? -1 : next))
+}
+
+async function cycleRoleFilter($: EngineInterface) {
+  await update($, roleFilter, was => ROLE_FILTERS[(ROLE_FILTERS.indexOf(was) + 1) % ROLE_FILTERS.length] ?? 'all')
+  await update($, listTop, () => -1)
 }
 
 // What the copy key puts on the clipboard: the row as the detail half shows it.
@@ -324,7 +356,12 @@ export const register: Register = on => {
 
     const { message } = stored
     const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
-    const base = { turn: turns, at }
+    const base = {
+      turn: turns,
+      at,
+      role: message.role ?? ('none' as const),
+      source: message.name ? `${e.door}:${message.name}` : e.door,
+    }
     const blocks = message.content as Block[]
 
     if (e.door === 'tool-result') {
@@ -396,17 +433,32 @@ export const register: Register = on => {
     return ran
   })
 
+  // The pane draws its own two windows, so the wheel moves them, never the body.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { listRows, detailRows, maxLineTop } = drawn
+    if (listRows === 0) return {}
+    // The search field's height is the surface's: what the tree has beyond the rest.
+    const searchRows = Math.max(0, e.contentRows - (CHROME_ROWS - 2 + listRows + detailRows))
+    const detailStart = 1 + searchRows + 5 + listRows + 1
+    const delta = e.pointer ? e.by * WHEEL_STEP : e.by
+    if (e.pointer && e.pointer.row >= detailStart) await scrollDetail($, delta, maxLineTop)
+    else await scrollList($, delta, listRows)
+
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
     // Mobile draws no text field: search is left out there.
     const Input = 'Input' in elements ? elements.Input : undefined
-    const [list, stepList, m, currentMode, q, current, top, lineTop, now] = await Promise.all([
+    const [list, stepList, m, currentMode, q, currentRole, current, top, lineTop, now] = await Promise.all([
       read($, rows),
       read($, steps),
       read($, meta),
       read($, mode),
       read($, query),
+      read($, roleFilter),
       read($, selected),
       read($, listTop),
       read($, detailTop),
@@ -476,10 +528,10 @@ export const register: Register = on => {
     const detailRows = room - listRows
 
     const needle = q.trim().toLowerCase()
-    const matches = matchesOf(list, q)
+    const matches = matchesOf(list, q, currentRole)
     const shownTop = topOf(top, matches.length, listRows)
     const shown = matches.slice(shownTop, shownTop + listRows)
-    const textWidth = width - GUTTER - BADGE - 1
+    const textWidth = width - GUTTER - BADGE - ROLE_WIDTH - 1
 
     const summaryOf = (row: TrajectoryRow) => {
       if (row.title !== undefined) return row.title
@@ -512,7 +564,8 @@ export const register: Register = on => {
           <Text color={colorOf(row)} bold>
             {badgeOf(row).padStart(BADGE - 1)}
           </Text>{' '}
-          <Text dimColor={row.kind === 'thinking'} inverse={isSelected}>
+          <Text dimColor>{roleLabelOf(row.role).padEnd(ROLE_WIDTH)}</Text>
+          <Text dimColor={row.kind === 'thinking' || row.role === 'none'} inverse={isSelected}>
             {fit(summaryOf(row), textWidth)}
           </Text>
         </Button>
@@ -538,6 +591,12 @@ export const register: Register = on => {
     const pickedInfo = picked
       ? [
           picked.tool,
+          picked.role === undefined
+            ? 'role unknown'
+            : picked.role === 'none'
+              ? 'not sent to the model'
+              : `role: ${picked.role}`,
+          picked.source,
           picked.turn > 0 ? `Turn ${picked.turn}` : '',
           clockOf(picked.at),
           picked.endAt !== undefined ? formatMs(picked.endAt - picked.at) : '',
@@ -550,8 +609,7 @@ export const register: Register = on => {
           .join(' · ')
       : 'Select a row to see it whole here'
     const detailFiller = Array.from({ length: detailRows - detailShown.length }, () => <Text> </Text>)
-    const scrollDetail = (delta: number) =>
-      update($, detailTop, t => Math.min(maxLineTop, Math.max(0, Math.min(t, maxLineTop) + delta)))
+    drawn = { listRows, detailRows, maxLineTop }
 
     // Footer: what the session cost, as the steps report it.
     const tokens = stepList.reduce((n, s) => n + s.input + s.output + s.cacheRead + s.cacheWrite, 0)
@@ -586,8 +644,13 @@ export const register: Register = on => {
           {modeButton('duration', 'Duration', 'd')}
           {modeButton('turns', 'Turns', 't')}
           {modeButton('calls', 'Calls', 'c')}
+          <Button key="role-filter" plain hotkey="r" onPress={() => cycleRoleFilter($)}>
+            <Text dimColor={currentRole === 'all'} color={currentRole === 'all' ? undefined : 'suggestion'} bold={currentRole !== 'all'}>
+              role: {currentRole}
+            </Text>
+          </Button>
           <Text dimColor>
-            {needle ? `${matches.length}/${list.length}` : `${list.length}`} rows
+            {needle || currentRole !== 'all' ? `${matches.length}/${list.length}` : `${list.length}`} rows
           </Text>
           <Box flexGrow={1} />
           {shownTop > 0 && (
@@ -639,10 +702,10 @@ export const register: Register = on => {
           <Button key="next" plain hotkey="j" onPress={() => moveSelection($, 1, listRows)}>
             <Text dimColor>next</Text>
           </Button>
-          <Button key="detail-up" plain hotkey="p" onPress={() => scrollDetail(-(detailRows - 1))}>
+          <Button key="detail-up" plain hotkey="p" onPress={() => scrollDetail($, -(detailRows - 1), maxLineTop)}>
             <Text dimColor>▲</Text>
           </Button>
-          <Button key="detail-down" plain hotkey="n" onPress={() => scrollDetail(detailRows - 1)}>
+          <Button key="detail-down" plain hotkey="n" onPress={() => scrollDetail($, detailRows - 1, maxLineTop)}>
             <Text dimColor>▼</Text>
           </Button>
         </Box>
