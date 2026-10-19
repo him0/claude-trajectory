@@ -75,7 +75,7 @@ test('every kind of row lands on the timeline, on every surface', async ($, on) 
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    for (const text of ['SYSTEM', 'USER', 'CONTEXT', 'ASSISTANT', 'TOOL', 'Turn 1', 'nested_memory']) {
+    for (const text of ['SYSTEM', 'USER', 'CONTEXT', 'ASSISTANT', 'TOOL', 'T1', 'nested_memory']) {
       expect(await ui.find({ text: new RegExp(text) })).toBeDefined()
     }
     expect(await ui.find({ text: /Bash .*ls -la.*→ package\.json/ })).toBeDefined()
@@ -125,6 +125,47 @@ test('the system prompt row opens to the prompt the model was sent', async ($, o
   await ui.unmount()
 })
 
+const COMPOSE = {
+  model: 'claude-opus-5-5',
+  promptModel: 'claude-opus-5-5',
+  surfaces: ['terminal'],
+  tools: [],
+  outputStyle: null,
+  traits: [],
+} as const
+
+function composesOnce(on: On) {
+  on('prompt.compose', async () => ({
+    sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }],
+  }))
+}
+
+test('a prompt composed before session.start still fills the system row', async ($, on) => {
+  bottoms(on)
+  composesOnce(on)
+  await $.prompt.compose(COMPOSE)
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /Initial System Prompt · 1 sections/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the system row keeps its prompt after /clear', async ($, on) => {
+  bottoms(on)
+  composesOnce(on)
+  on('session.end', async () => ({ sessionId: 's1' }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.prompt.compose(COMPOSE)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /Initial System Prompt · 1 sections/ })).toBeDefined()
+  await ui.press({ key: 'press-system' })
+  expect(await ui.find({ type: 'Text', text: /^You are Claude Code\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a pressed row opens below the list, and j/k walk the rows', async ($, on) => {
   bottoms(on)
   await playOneTurn($)
@@ -132,9 +173,9 @@ test('a pressed row opens below the list, and j/k walk the rows', async ($, on) 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ text: /Select a row/ })).toBeDefined()
   await ui.press({ key: 'press-tu1' })
-  expect(await ui.find({ type: 'Text', text: /^\{"command":"ls -la"\}$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}"command": "ls -la"$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^→ package\.json$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /3 lines · ≈8 tok$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /5 lines · ≈8 tok$/ })).toBeDefined()
 
   await ui.press({ key: 'prev' })
   expect(await ui.find({ type: 'Text', text: /^設定ファイルを洗い出します。$/ })).toBeDefined()
@@ -156,7 +197,40 @@ test('y copies the selected row, its result included', async ($, on) => {
   expect(await ui.find({ key: 'copy' })).toBeUndefined()
   await ui.press({ key: 'press-tu1' })
   await ui.press({ key: 'copy' })
-  expect(copied).toEqual(['Bash {"command":"ls -la"}\n\n→ package.json'])
+  expect(copied).toEqual(['Bash {\n  "command": "ls -la"\n}\n\n→ package.json'])
+  await ui.unmount()
+})
+
+test("a tool's JSON result is pretty-printed in the detail, and stays one line in the list", async ($, on) => {
+  bottoms(on)
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.session.append({
+    door: 'response',
+    origin: { kind: 'model', model: 'claude-opus-5-5' },
+    uuid: 'u1',
+    message: {
+      type: 'assistant',
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'Read', input: { file_path: '/tmp/a.json' } }],
+    },
+  })
+  await $.session.append({
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Read' },
+    uuid: 'u2',
+    message: {
+      type: 'user',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: '{"ok":true,"n":[1,2]}' }],
+    },
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /→ \{"ok":true,"n":\[1,2\]\}/ })).toBeDefined()
+  await ui.press({ key: 'press-tu1' })
+  expect(await ui.find({ type: 'Text', text: /^→ \{$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}"ok": true,$/ })).toBeDefined()
   await ui.unmount()
 })
 

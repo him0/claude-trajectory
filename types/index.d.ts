@@ -49,7 +49,13 @@ export type TrajectoryMeta = {
   turnStartAt: number
 }
 
-export type TrajectoryMode = 'duration' | 'turns' | 'calls'
+/** The first system prompt the session composed, as the system row shows it. */
+export type TrajectorySystemPrompt = {
+  title: string
+  text: string
+}
+
+export type TrajectoryMode ='duration' | 'turns' | 'calls'
 
 declare module 'claude-code' {
   interface PluginState {
@@ -66,6 +72,8 @@ declare module 'claude-code' {
       listTop: number
       /** The first line the detail half shows. */
       detailTop: number
+      /** null until the engine composes a system prompt. */
+      systemPrompt: TrajectorySystemPrompt | null
     }
   }
 }

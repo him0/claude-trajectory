@@ -9,6 +9,7 @@ import type {
   TrajectoryRoleFilter,
   TrajectoryRow,
   TrajectoryStep,
+  TrajectorySystemPrompt,
 } from '../types'
 
 const PANE = 'trajectory'
@@ -18,7 +19,7 @@ const MAX_TEXT = 20_000
 const MAX_SYSTEM_TEXT = 80_000
 // Header, search, minimap with its margins, divider and footer.
 const CHROME_ROWS = 10
-const GUTTER = 7
+const GUTTER = 5
 const BADGE = 10
 const MINIMAP_LABEL = 7
 const MARK = '⣿'
@@ -36,6 +37,12 @@ const roleFilter = atom({ plugin: 'trajectory', key: 'roleFilter' } as const, 'a
 const selected = atom({ plugin: 'trajectory', key: 'selected' } as const, '')
 const listTop = atom({ plugin: 'trajectory', key: 'listTop' } as const, -1)
 const detailTop = atom({ plugin: 'trajectory', key: 'detailTop' } as const, 0)
+// Kept apart from the rows: the engine may compose the prompt before
+// session.start or not again after /clear, and a reset must not lose it.
+const systemPrompt = atom(
+  { plugin: 'trajectory', key: 'systemPrompt' } as const,
+  null as TrajectorySystemPrompt | null,
+)
 
 const COLORS: Record<TrajectoryKind, ThemeKey> = {
   system: 'inactive',
@@ -117,13 +124,14 @@ const formatTokens = (n: number) =>
 const formatMs = (ms: number) =>
   ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m` : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`
 
-const systemRow = (at: number): TrajectoryRow => ({
+const systemRow = (at: number, prompt: TrajectorySystemPrompt | null): TrajectoryRow => ({
   id: 'system',
   kind: 'system',
   role: 'system',
   turn: 0,
   at,
   text: 'Initial System Prompt',
+  ...prompt,
 })
 
 async function push($: EngineInterface, added: TrajectoryRow[]) {
@@ -132,8 +140,8 @@ async function push($: EngineInterface, added: TrajectoryRow[]) {
 }
 
 async function reset($: EngineInterface) {
-  const now = await $.clock.now()
-  await update($, rows, () => [systemRow(now)])
+  const [now, prompt] = await Promise.all([$.clock.now(), read($, systemPrompt)])
+  await update($, rows, () => [systemRow(now, prompt)])
   await update($, steps, () => [])
   await update($, meta, () => ({ startAt: now, turns: 0, turnStartAt: now }))
   await update($, selected, () => '')
@@ -218,11 +226,29 @@ async function cycleRoleFilter($: EngineInterface) {
   await update($, listTop, () => -1)
 }
 
+// JSON indented for reading; anything else, a clipped JSON among it, as it is.
+const prettyOf = (text: string) => {
+  const trimmed = text.trim()
+  if (!/^[[{]/.test(trimmed)) return text
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2)
+  } catch {
+    return text
+  }
+}
+
+// A row's text and result as the detail half shows them: a tool's pretty-printed.
+const shownOf = (row: TrajectoryRow) =>
+  row.kind === 'tool'
+    ? { text: prettyOf(row.text), result: row.result !== undefined ? prettyOf(row.result) : undefined }
+    : { text: row.text, result: row.result }
+
 // What the copy key puts on the clipboard: the row as the detail half shows it.
 const copyTextOf = (row: TrajectoryRow) => {
-  const head = row.tool ? `${row.tool} ${row.text}` : row.text
+  const { text, result } = shownOf(row)
+  const head = row.tool ? `${row.tool} ${text}` : text
 
-  return row.result !== undefined ? `${head}\n\n→ ${row.result}` : head
+  return result !== undefined ? `${head}\n\n→ ${result}` : head
 }
 
 async function copyRow($: EngineInterface, row: TrajectoryRow, surface: RenderSurface) {
@@ -280,22 +306,22 @@ export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const list = await read($, rows)
-    const system = list.find(row => row.id === 'system')
-    if (system && system.title === undefined) {
+    let prompt = await read($, systemPrompt)
+    if (prompt === null) {
       const chars = composed.sections.reduce((n, s) => n + s.text.length, 0)
       const body = composed.sections.map(s => `## ${s.id} (${s.scope})\n${s.text}`).join('\n\n')
+      const first = {
+        title: `Initial System Prompt · ${composed.sections.length} sections · ${formatTokens(chars)} chars · ${e.model}`,
+        text: clip(body, MAX_SYSTEM_TEXT),
+      }
+      prompt = first
+      await update($, systemPrompt, () => first)
+    }
+    const list = await read($, rows)
+    if (list.some(row => row.id === 'system' && row.title === undefined)) {
+      const shown = prompt
       await update($, rows, all =>
-        all.map(row =>
-          row.id === 'system'
-            ? {
-                ...row,
-                title: `Initial System Prompt · ${composed.sections.length} sections · ${formatTokens(chars)} chars · ${e.model}`,
-                text: clip(body, MAX_SYSTEM_TEXT),
-                result: undefined,
-              }
-            : row,
-        ),
+        all.map(row => (row.id === 'system' ? { ...row, ...shown, result: undefined } : row)),
       )
     }
 
@@ -547,7 +573,7 @@ export const register: Register = on => {
 
     let lastTurn = shownTop > 0 ? (matches[shownTop - 1]?.turn ?? -1) : -1
     const lines = shown.map(row => {
-      const gutter = row.turn !== lastTurn && row.turn > 0 ? `Turn ${row.turn}` : ''
+      const gutter = row.turn !== lastTurn && row.turn > 0 ? `T${row.turn}` : ''
       lastTurn = row.turn
       const isSelected = current === row.id
 
@@ -578,11 +604,12 @@ export const register: Register = on => {
     const bodyWidth = Math.max(10, width - 1)
     const detail: { text: string; tone?: 'result' | 'error' }[] = []
     if (picked) {
-      for (const text of wrapLines(picked.text, bodyWidth)) detail.push({ text })
-      if (picked.result !== undefined) {
+      const { text: body, result } = shownOf(picked)
+      for (const text of wrapLines(body, bodyWidth)) detail.push({ text })
+      if (result !== undefined) {
         detail.push({ text: '' })
         const tone = picked.isError ? 'error' : 'result'
-        for (const text of wrapLines(`→ ${picked.result}`, bodyWidth)) detail.push({ text, tone })
+        for (const text of wrapLines(`→ ${result}`, bodyWidth)) detail.push({ text, tone })
       }
     }
     const maxLineTop = Math.max(0, detail.length - detailRows)

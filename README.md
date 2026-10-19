@@ -8,11 +8,13 @@ Duration  Turns  Calls  role: all   42 rows      ▲ 12 earlier  latest ▼
 Input  ⣿⣿ ⣿    ⣿
 Model    ⣿⣿ ⣿⣿ ⣿⣿
 Tools      ⣿⣿⣿ ⣿⣿⣿⣿
-Turn 2   ASSISTANT asst Let me list the config files first.
-           CONTEXT user [nested_memory] <system-reminder>…
-▶             TOOL asst Bash {"command":"ls -la"} 1.2s → package.json
-TOOL Bash · role: assistant · response · Turn 2 · 01:12:03 · 1.2s · 3 lines · ≈8 tok   y: copy  k: prev  j: next  p: ▲  n: ▼
-{"command":"ls -la"}
+T2   ASSISTANT asst Let me list the config files first.
+         CONTEXT user [nested_memory] <system-reminder>…
+▶           TOOL asst Bash {"command":"ls -la"} 1.2s → package.json
+TOOL Bash · role: assistant · response · Turn 2 · 01:12:03 · 1.2s · 5 lines · ≈8 tok   y: copy  k: prev  j: next  p: ▲  n: ▼
+{
+  "command": "ls -la"
+}
 
 → package.json
 3 turns · 12 steps · 30 calls · 2.1M tok · cache hit 96% · 4.2m
@@ -40,11 +42,11 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Run `/trajectory` to open the pane.
 
-- **Top half**: one row per event, with a colored badge (`SYSTEM`, `USER`, `CONTEXT`, `ASSISTANT`, `THINKING`, `TOOL`) and the role a request carries it under (`sys`, `user`, `asst`, or `—` for a row the model never reads, drawn dim). Tool rows show the input, how long the call took and its result.
+- **Top half**: one row per event, with its turn (`T1`, `T2`, … on the turn's first row), a colored badge (`SYSTEM`, `USER`, `CONTEXT`, `ASSISTANT`, `THINKING`, `TOOL`) and the role a request carries it under (`sys`, `user`, `asst`, or `—` for a row the model never reads, drawn dim). Tool rows show the input, how long the call took and its result.
 - **Minimap**: Input / Model / Tools lanes, laid out by **Duration** (`d`, wall-clock), **Turns** (`t`) or **Calls** (`c`, one slot per row).
 - **Search**: filters rows by kind, tool name, text or result.
 - **Role filter**: `role: all` cycles through `system`, `user`, `assistant` and `none` (not sent to the model).
-- **Bottom half**: click a row to read it whole: the system prompt's sections, a full prompt, a tool call's input and result. The header shows its role (or that it is not sent to the model), the door it came in by, its turn, time, duration, line count and an estimated token count.
+- **Bottom half**: click a row to read it whole: the system prompt's sections, a full prompt, a tool call's input and result (JSON pretty-printed, as `y` copies it). The header shows its role (or that it is not sent to the model), the door it came in by, its turn, time, duration, line count and an estimated token count.
 - **Mouse wheel**: scrolls the list over the top half and the detail over the bottom half.
 
 Keys, once the pane has focus (`ctrl+x tab`):
