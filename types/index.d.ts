@@ -55,6 +55,12 @@ export type TrajectorySystemPrompt = {
   text: string
 }
 
+/** The context blocks of the first user message, as the context row shows them. */
+export type TrajectoryUserContext = {
+  title: string
+  text: string
+}
+
 export type TrajectoryMode ='duration' | 'turns' | 'calls'
 
 declare module 'claude-code' {
@@ -74,6 +80,10 @@ declare module 'claude-code' {
       detailTop: number
       /** null until the engine composes a system prompt. */
       systemPrompt: TrajectorySystemPrompt | null
+      /** null until the engine computes the first message's context blocks. */
+      userContext: TrajectoryUserContext | null
+      /** Where each reminder already made a row stands: replies before it, hash, occurrence. */
+      seenReminders: string[]
     }
   }
 }

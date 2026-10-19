@@ -319,3 +319,99 @@ test('the wheel scrolls the list over the list and the detail over the detail', 
   expect(await ui.find({ text: /▲ 23 earlier/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('the context row shows the CLAUDE.md the first message carries', async ($, on) => {
+  bottoms(on)
+  on('prompt.context', async () => ({
+    blocks: [
+      { name: 'claudeMd', text: 'Contents of /tmp/CLAUDE.md (project):\n\nUse pnpm.' },
+      { name: 'currentDate', text: "Today's date is 2026-10-19." },
+    ],
+  }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.prompt.context({
+    blocks: [],
+    instructionFiles: [{ path: '/tmp/CLAUDE.md', kind: 'project', content: 'Use pnpm.' }],
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /User Context · claudeMd \(1 files\) · currentDate/ })).toBeDefined()
+  await ui.press({ key: 'press-context' })
+  expect(await ui.find({ type: 'Text', text: /^- \/tmp\/CLAUDE\.md \(project\)$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Use pnpm\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('opening the pane reads the memory files when no prompt.context came by', async ($, on) => {
+  bottoms(on)
+  composesOnce(on)
+  on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+  on('ui.open', async () => ({ value: { isPlaced: true } }))
+  // Only the fields the mod reads.
+  on('session.usage', async () => ({
+    value: {
+      context: { breakdown: { memoryFiles: [{ path: '/tmp/CLAUDE.md', type: 'Project', tokens: 3 }] } },
+    } as never,
+  }))
+  on('fs.read', async () => ({ value: 'Use pnpm.' }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.command.run({
+    command: 'trajectory',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /User Context · claudeMd \(1 files, read at open\)/ })).toBeDefined()
+  await ui.press({ key: 'press-context' })
+  expect(await ui.find({ type: 'Text', text: /^Use pnpm\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('reminders a request carries become rows, each once, CLAUDE.md as sent', async ($, on) => {
+  bottoms(on)
+  const first = {
+    role: 'user',
+    content: [
+      { type: 'text', text: '<system-reminder>\nCodebase and user instructions are shown below.\n\nContents of /tmp/CLAUDE.md (project instructions, checked into the codebase):\n\nUse pnpm.\n</system-reminder>' },
+      { type: 'text', text: 'lint の残りを調べて' },
+    ],
+  }
+  const nested = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 'tu1',
+        content:
+          '1\texport type A = 1\n\n<system-reminder>\nContents of /tmp/types/CLAUDE.md:\n\nmarker: nested-types\n</system-reminder>',
+      },
+      { type: 'text', text: '<system-reminder>\nToday is 2026-10-20.\n</system-reminder>' },
+    ],
+  }
+  const reply = { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }] }
+  let conversation: unknown[] = [first]
+  on('session.messages', async () => ({ value: conversation as never }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'lint の残りを調べて', turnId: 't1' })
+  // Only the scan before the request matters here, not what the request brings.
+  const step = async () => {
+    try {
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+      for await (const _ of stream);
+    } catch {}
+  }
+  await step()
+  conversation = [first, reply, nested]
+  await step()
+  await step()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /User Context · claudeMd \(1 files, as sent\)/ })).toBeDefined()
+  expect(await ui.findAll({ type: 'Text', text: /Contents of \/tmp\/types\/CLAUDE\.md/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /Today is 2026-10-20/ })).toHaveLength(1)
+  await ui.press({ key: 'press-context' })
+  expect(await ui.find({ type: 'Text', text: /^- \/tmp\/CLAUDE\.md \(project instructions, checked into the codebase\)$/ })).toBeDefined()
+  await ui.unmount()
+})

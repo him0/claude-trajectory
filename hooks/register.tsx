@@ -1,5 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptComposeSection, Register, RenderSurface, ThemeKey } from 'claude-code'
+import type {
+  EngineInterface,
+  InstructionFile,
+  PromptComposeSection,
+  PromptContextBlock,
+  Register,
+  RenderSurface,
+  ThemeKey,
+} from 'claude-code'
 
 import type {
   TrajectoryKind,
@@ -10,6 +18,7 @@ import type {
   TrajectoryRow,
   TrajectoryStep,
   TrajectorySystemPrompt,
+  TrajectoryUserContext,
 } from '../types'
 
 const PANE = 'trajectory'
@@ -43,6 +52,15 @@ const systemPrompt = atom(
   { plugin: 'trajectory', key: 'systemPrompt' } as const,
   null as TrajectorySystemPrompt | null,
 )
+// The context blocks (CLAUDE.md among them) the first user message carries:
+// the engine prepends them at request time, so no session.append brings them.
+const userContext = atom(
+  { plugin: 'trajectory', key: 'userContext' } as const,
+  null as TrajectoryUserContext | null,
+)
+// The reminders already made rows, by where they stand in the conversation:
+// injected at request time, they reach no session.append.
+const seenReminders = atom({ plugin: 'trajectory', key: 'seenReminders' } as const, [] as string[])
 
 const COLORS: Record<TrajectoryKind, ThemeKey> = {
   system: 'inactive',
@@ -154,15 +172,173 @@ async function recordSystemPrompt($: EngineInterface, sections: readonly PromptC
   }
 }
 
+const contextRow = (at: number, context: TrajectoryUserContext): TrajectoryRow => ({
+  id: 'context',
+  kind: 'context',
+  role: 'user',
+  source: 'context',
+  turn: 0,
+  at,
+  ...context,
+})
+
+// Rows from the reset start with the system row, then the context row once known.
+const openingRows = (at: number, prompt: TrajectorySystemPrompt | null, context: TrajectoryUserContext | null) =>
+  context ? [systemRow(at, prompt), contextRow(at, context)] : [systemRow(at, prompt)]
+
+const filesLine = (files: readonly { path: string; kind: string }[]) =>
+  files.map(f => `- ${f.path} (${f.kind})`).join('\n')
+
+// Keeps the latest context the engine computed (it computes it again after /clear
+// or a compaction), and puts its row after the system row.
+async function recordUserContext($: EngineInterface, context: TrajectoryUserContext) {
+  await update($, userContext, () => context)
+  const at = await $.clock.now()
+  await update($, rows, list => {
+    if (list.some(row => row.id === 'context')) {
+      return list.map(row => (row.id === 'context' ? { ...row, ...context } : row))
+    }
+    const after = list.findIndex(row => row.id === 'system') + 1
+    if (list.length === 0) return list
+
+    return [...list.slice(0, after), contextRow(at, context), ...list.slice(after)].slice(-MAX_ROWS)
+  })
+}
+
+function contextOfBlocks(blocks: readonly PromptContextBlock[], files: readonly InstructionFile[] | undefined) {
+  const shown = blocks.filter(b => b.text.trim() !== '')
+  const names = shown.map(b =>
+    b.name === 'claudeMd' && files ? `${b.name} (${files.length} files)` : b.name,
+  )
+  const body = [
+    ...(files && files.length > 0 ? [`# instruction files\n${filesLine(files)}`] : []),
+    ...shown.map(b => `# ${b.name}\n${b.text}`),
+  ].join('\n\n')
+
+  return {
+    title: `User Context · ${names.join(' · ') || 'no blocks'}`,
+    text: clip(body, MAX_SYSTEM_TEXT),
+  }
+}
+
+// Where no prompt.context hook ran: the memory files /context lists, read from
+// disk now, which may differ from what the session was sent.
+async function contextFromDisk($: EngineInterface): Promise<TrajectoryUserContext | null> {
+  const usage = await $.session.usage({ breakdown: 'summary' })
+  const files = usage.context.breakdown?.memoryFiles ?? []
+  if (files.length === 0) return null
+  const texts = await Promise.all(
+    files.map(async f => {
+      const content = await $.fs.read(f.path).catch(() => '(could not read)')
+
+      return `## ${f.path} (${f.type})\n${typeof content === 'string' ? content : '(binary)'}`
+    }),
+  )
+  const listed = files.map(f => ({ path: f.path, kind: f.type }))
+
+  return {
+    title: `User Context · claudeMd (${files.length} files, read at open)`,
+    text: clip(`# instruction files\n${filesLine(listed)}\n\n# claudeMd\n${texts.join('\n\n')}`, MAX_SYSTEM_TEXT),
+  }
+}
+
+const REMINDER = '<system-reminder>'
+// How the engine opens the block that carries the CLAUDE.md files and rules.
+const INSTRUCTIONS = 'Codebase and user instructions are shown below'
+const MAX_SEEN = 5000
+
+const hashOf = (text: string) => {
+  let h = 5381
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0
+
+  return `${(h >>> 0).toString(36)}.${text.length}`
+}
+
+// The instruction files as the request carried them, in place of the disk's.
+function contextOfInstructions(text: string): TrajectoryUserContext {
+  const files = [...text.matchAll(/^Contents of (.+?)(?: \(([^)]*)\))?:$/gm)].map(m => ({
+    path: m[1] ?? '',
+    kind: m[2] ?? 'project',
+  }))
+
+  return {
+    title: `User Context · claudeMd (${files.length} files, as sent)`,
+    text: clip(`# instruction files\n${filesLine(files)}\n\n# claudeMd\n${text}`, MAX_SYSTEM_TEXT),
+  }
+}
+
+// A reminder is a text block of its own, or is joined onto the end of the
+// last tool result (a nested CLAUDE.md, a path-scoped rule a Read brought).
+function remindersOf(block: { type: string; [field: string]: unknown }): string[] {
+  if (block.type === 'text') {
+    const text = typeof block.text === 'string' ? block.text : ''
+
+    return text.trimStart().startsWith(REMINDER) ? [text] : []
+  }
+  if (block.type !== 'tool_result') return []
+
+  return [...textOf(block.content).matchAll(/<system-reminder>[\s\S]*?<\/system-reminder>/g)].map(m => m[0])
+}
+
+// Makes rows of the reminders the request about to be sent carries: the
+// trailing user messages, or with `isWhole` the whole conversation.
+async function scanRequest($: EngineInterface, isWhole: boolean) {
+  const messages = await $.session.messages({ as: 'api' })
+  const lastReply = messages.findLastIndex(m => m.role === 'assistant')
+  const found: { key: string; text: string }[] = []
+  let replies = messages.slice(0, isWhole ? 0 : lastReply + 1).filter(m => m.role === 'assistant').length
+  messages.slice(isWhole ? 0 : lastReply + 1).forEach(m => {
+    if (m.role === 'assistant') {
+      replies++
+      return
+    }
+    const counts = new Map<string, number>()
+    for (const text of m.content.flatMap(remindersOf)) {
+      const hash = hashOf(text)
+      const n = (counts.get(hash) ?? 0) + 1
+      counts.set(hash, n)
+      found.push({ key: `${replies}:${hash}:${n}`, text })
+    }
+  })
+  if (found.length === 0) return
+
+  let fresh: typeof found = []
+  await update($, seenReminders, seen => {
+    const known = new Set(seen)
+    fresh = found.filter(f => !known.has(f.key))
+
+    return [...seen, ...fresh.map(f => f.key)].slice(-MAX_SEEN)
+  })
+  const instructions = fresh.find(f => f.text.includes(INSTRUCTIONS))
+  if (instructions) await recordUserContext($, contextOfInstructions(instructions.text))
+
+  const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
+  await push(
+    $,
+    fresh
+      .filter(f => f !== instructions)
+      .map(f => ({
+        id: `request:${f.key}`,
+        kind: 'context' as const,
+        role: 'user' as const,
+        source: 'request',
+        turn: turns,
+        at,
+        text: clip(f.text),
+      })),
+  )
+}
+
 async function push($: EngineInterface, added: TrajectoryRow[]) {
   if (added.length === 0) return
   await update($, rows, list => [...list, ...added].slice(-MAX_ROWS))
 }
 
 async function reset($: EngineInterface) {
-  const [now, prompt] = await Promise.all([$.clock.now(), read($, systemPrompt)])
-  await update($, rows, () => [systemRow(now, prompt)])
+  const [now, prompt, context] = await Promise.all([$.clock.now(), read($, systemPrompt), read($, userContext)])
+  await update($, rows, () => openingRows(now, prompt, context))
   await update($, steps, () => [])
+  await update($, seenReminders, () => [])
   await update($, meta, () => ({ startAt: now, turns: 0, turnStartAt: now }))
   await update($, selected, () => '')
   await update($, listTop, () => -1)
@@ -325,6 +501,13 @@ export const register: Register = on => {
       const [composed, model] = await Promise.all([$.prompt.compose(), $.session.model()])
       await recordSystemPrompt($, composed.sections, model)
     }
+    // The same holds for prompt.context and prompt.attachment: read the
+    // conversation as sent, and before any request the memory files on disk.
+    await scanRequest($, true).catch(() => undefined)
+    if ((await read($, userContext)) === null) {
+      const context = await contextFromDisk($).catch(() => null)
+      if (context) await recordUserContext($, context)
+    }
     await $.ui.open({ id: PANE, title: 'Trajectory' })
 
     return { text: 'Trajectory pane opened.' }
@@ -335,6 +518,13 @@ export const register: Register = on => {
     await recordSystemPrompt($, composed.sections, e.model)
 
     return composed
+  })
+
+  on('prompt.context', async ($, e, next) => {
+    const result = await next(e)
+    await recordUserContext($, contextOfBlocks(result.blocks, result.instructionFiles ?? e.instructionFiles))
+
+    return result
   })
 
   on('turn.start', async ($, e, next) => {
@@ -349,6 +539,7 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
 
+    await scanRequest($, false).catch(() => undefined)
     const { turns } = await read($, meta)
     const startAt = await $.clock.now()
     const step: TrajectoryStep = {
