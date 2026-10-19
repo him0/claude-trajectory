@@ -63,6 +63,7 @@ Keys, once the pane has focus (`ctrl+x tab`):
 ## Notes
 
 - Only the main conversation is recorded; subagents' rows are left out.
+- Where an organization manages Claude Code, an installed plugin's `prompt.compose` hook does not run: the system prompt is then composed when `/trajectory` opens the pane.
 - The last 1000 rows are kept; each row's text up to 20,000 characters (80,000 for the system prompt).
 - Token counts in the detail header are a local estimate (about 4 ASCII characters, or 1 other character, per token).
 - `/clear` starts the timeline over.

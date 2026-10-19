@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderSurface, ThemeKey } from 'claude-code'
+import type { EngineInterface, PromptComposeSection, Register, RenderSurface, ThemeKey } from 'claude-code'
 
 import type {
   TrajectoryKind,
@@ -133,6 +133,26 @@ const systemRow = (at: number, prompt: TrajectorySystemPrompt | null): Trajector
   text: 'Initial System Prompt',
   ...prompt,
 })
+
+// Keeps the first prompt composed, and fills the system row if it is still bare.
+async function recordSystemPrompt($: EngineInterface, sections: readonly PromptComposeSection[], model: string) {
+  let prompt = await read($, systemPrompt)
+  if (prompt === null) {
+    const chars = sections.reduce((n, s) => n + s.text.length, 0)
+    const body = sections.map(s => `## ${s.id} (${s.scope})\n${s.text}`).join('\n\n')
+    const first = {
+      title: `Initial System Prompt · ${sections.length} sections · ${formatTokens(chars)} chars · ${model}`,
+      text: clip(body, MAX_SYSTEM_TEXT),
+    }
+    prompt = first
+    await update($, systemPrompt, () => first)
+  }
+  const list = await read($, rows)
+  if (list.some(row => row.id === 'system' && row.title === undefined)) {
+    const shown = prompt
+    await update($, rows, all => all.map(row => (row.id === 'system' ? { ...row, ...shown, result: undefined } : row)))
+  }
+}
 
 async function push($: EngineInterface, added: TrajectoryRow[]) {
   if (added.length === 0) return
@@ -299,6 +319,12 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'trajectory' }, async $ => {
+    // Where an organization manages Claude Code, a plugin the person installs
+    // is passed over at prompt.compose: ask the engine for the prompt instead.
+    if ((await read($, systemPrompt)) === null) {
+      const [composed, model] = await Promise.all([$.prompt.compose(), $.session.model()])
+      await recordSystemPrompt($, composed.sections, model)
+    }
     await $.ui.open({ id: PANE, title: 'Trajectory' })
 
     return { text: 'Trajectory pane opened.' }
@@ -306,24 +332,7 @@ export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    let prompt = await read($, systemPrompt)
-    if (prompt === null) {
-      const chars = composed.sections.reduce((n, s) => n + s.text.length, 0)
-      const body = composed.sections.map(s => `## ${s.id} (${s.scope})\n${s.text}`).join('\n\n')
-      const first = {
-        title: `Initial System Prompt · ${composed.sections.length} sections · ${formatTokens(chars)} chars · ${e.model}`,
-        text: clip(body, MAX_SYSTEM_TEXT),
-      }
-      prompt = first
-      await update($, systemPrompt, () => first)
-    }
-    const list = await read($, rows)
-    if (list.some(row => row.id === 'system' && row.title === undefined)) {
-      const shown = prompt
-      await update($, rows, all =>
-        all.map(row => (row.id === 'system' ? { ...row, ...shown, result: undefined } : row)),
-      )
-    }
+    await recordSystemPrompt($, composed.sections, e.model)
 
     return composed
   })

@@ -151,6 +151,24 @@ test('a prompt composed before session.start still fills the system row', async 
   await ui.unmount()
 })
 
+test('opening the pane asks for the prompt when no compose came by', async ($, on) => {
+  bottoms(on)
+  composesOnce(on)
+  on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+  on('ui.open', async () => ({ value: { isPlaced: true } }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.command.run({
+    command: 'trajectory',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /Initial System Prompt · 1 sections .* claude-opus-5-5/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('the system row keeps its prompt after /clear', async ($, on) => {
   bottoms(on)
   composesOnce(on)
