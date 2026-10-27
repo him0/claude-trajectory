@@ -61,6 +61,11 @@ const userContext = atom(
 // The reminders already made rows, by where they stand in the conversation:
 // injected at request time, they reach no session.append.
 const seenReminders = atom({ plugin: 'trajectory', key: 'seenReminders' } as const, [] as string[])
+// Whether a session.append of the main loop ever reached this mod: where an
+// organization's plugin passes it over, the rows are read from the transcript.
+const appendHeard = atom({ plugin: 'trajectory', key: 'appendHeard' } as const, false)
+// The transcript blocks already made rows, keyed as the reminders are.
+const seenBlocks = atom({ plugin: 'trajectory', key: 'seenBlocks' } as const, [] as string[])
 
 const COLORS: Record<TrajectoryKind, ThemeKey> = {
   system: 'inactive',
@@ -329,6 +334,74 @@ async function scanRequest($: EngineInterface, isWhole: boolean) {
   )
 }
 
+// Where no session.append hook ran: makes rows of what the transcript holds
+// from the last reply on, or with `isWhole` of the whole conversation. Rows
+// stand where they were found, so a tool's timing is the closest seen.
+async function scanTranscript($: EngineInterface, isWhole: boolean) {
+  if (await read($, appendHeard)) return
+  const messages = await $.session.messages({ as: 'api' })
+  const from = isWhole ? 0 : Math.max(0, messages.findLastIndex(m => m.role === 'assistant'))
+  const found: { key: string; row: Omit<TrajectoryRow, 'turn' | 'at'> }[] = []
+  const results = new Map<string, Block>()
+  let replies = messages.slice(0, from).filter(m => m.role === 'assistant').length
+  messages.slice(from).forEach(m => {
+    const counts = new Map<string, number>()
+    const keyOf = (text: string) => {
+      const hash = hashOf(text)
+      const n = (counts.get(hash) ?? 0) + 1
+      counts.set(hash, n)
+
+      return `${replies}:${hash}:${n}`
+    }
+    if (m.role === 'assistant') {
+      for (const b of m.content) {
+        const base = { role: 'assistant' as const, source: 'transcript' }
+        if (b.type === 'text' && String(b.text ?? '').trim() !== '') {
+          const key = keyOf(String(b.text))
+          found.push({ key, row: { ...base, id: `transcript:${key}`, kind: 'assistant', text: clip(String(b.text)) } })
+        } else if (b.type === 'thinking' && String(b.thinking ?? '').trim() !== '') {
+          const key = keyOf(String(b.thinking))
+          found.push({ key, row: { ...base, id: `transcript:${key}`, kind: 'thinking', text: clip(String(b.thinking)) } })
+        } else if (b.type === 'tool_use') {
+          found.push({
+            key: `tool:${String(b.id)}`,
+            row: { ...base, id: String(b.id), kind: 'tool', tool: String(b.name), text: clip(JSON.stringify(b.input ?? {})) },
+          })
+        }
+      }
+      replies++
+      return
+    }
+    for (const b of m.content) if (b.type === 'tool_result') results.set(String(b.tool_use_id), b)
+    // Reminders are scanRequest's: the rest of the message is what the person sent.
+    const text = textOf(m.content.filter(b => b.type !== 'tool_result' && remindersOf(b).length === 0))
+    if (text.trim() === '') return
+    const key = keyOf(text)
+    found.push({ key, row: { id: `transcript:${key}`, kind: 'user', role: 'user', source: 'transcript', text: clip(text) } })
+  })
+
+  let fresh: typeof found = []
+  if (found.length > 0) {
+    await update($, seenBlocks, seen => {
+      const known = new Set(seen)
+      fresh = found.filter(f => !known.has(f.key))
+
+      return [...seen, ...fresh.map(f => f.key)].slice(-MAX_SEEN)
+    })
+  }
+  const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
+  await push($, fresh.map(f => ({ ...f.row, turn: turns, at })))
+  if (results.size === 0) return
+  await update($, rows, list =>
+    list.map(row => {
+      const b = row.kind === 'tool' && row.result === undefined ? results.get(row.id) : undefined
+      if (!b) return row
+
+      return { ...row, endAt: row.endAt ?? at, result: clip(textOf(b.content)), isError: b.is_error === true }
+    }),
+  )
+}
+
 async function push($: EngineInterface, added: TrajectoryRow[]) {
   if (added.length === 0) return
   await update($, rows, list => [...list, ...added].slice(-MAX_ROWS))
@@ -339,6 +412,7 @@ async function reset($: EngineInterface) {
   await update($, rows, () => openingRows(now, prompt, context))
   await update($, steps, () => [])
   await update($, seenReminders, () => [])
+  await update($, seenBlocks, () => [])
   await update($, meta, () => ({ startAt: now, turns: 0, turnStartAt: now }))
   await update($, selected, () => '')
   await update($, listTop, () => -1)
@@ -501,9 +575,10 @@ export const register: Register = on => {
       const [composed, model] = await Promise.all([$.prompt.compose(), $.session.model()])
       await recordSystemPrompt($, composed.sections, model)
     }
-    // The same holds for prompt.context and prompt.attachment: read the
-    // conversation as sent, and before any request the memory files on disk.
+    // The same holds for prompt.context, prompt.attachment and session.append:
+    // read the conversation as sent, and before any request the memory files on disk.
     await scanRequest($, true).catch(() => undefined)
+    await scanTranscript($, true).catch(() => undefined)
     if ((await read($, userContext)) === null) {
       const context = await contextFromDisk($).catch(() => null)
       if (context) await recordUserContext($, context)
@@ -540,6 +615,7 @@ export const register: Register = on => {
     if (e.agentId !== undefined) return yield* next(e)
 
     await scanRequest($, false).catch(() => undefined)
+    await scanTranscript($, false).catch(() => undefined)
     const { turns } = await read($, meta)
     const startAt = await $.clock.now()
     const step: TrajectoryStep = {
@@ -554,6 +630,8 @@ export const register: Register = on => {
     await update($, steps, list => [...list, step].slice(-MAX_ROWS))
 
     const result = yield* next(e)
+    // The reply, before its tools run, so tool.call finds their rows.
+    await scanTranscript($, false).catch(() => undefined)
 
     const endAt = await $.clock.now()
     const usage = result.usage
@@ -576,7 +654,14 @@ export const register: Register = on => {
     return result
   })
 
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) await scanTranscript($, false).catch(() => undefined)
+
+    return next(e)
+  })
+
   on('session.append', async ($, e, next) => {
+    if (e.agentId === undefined && !(await read($, appendHeard))) await update($, appendHeard, () => true)
     const stored = await next(e)
     if (e.agentId !== undefined || e.door === 'queue' || stored.deny !== undefined) return stored
 

@@ -84,6 +84,10 @@ declare module 'claude-code' {
       userContext: TrajectoryUserContext | null
       /** Where each reminder already made a row stands: replies before it, hash, occurrence. */
       seenReminders: string[]
+      /** Whether a main-loop session.append reached the mod; false, rows come from the transcript. */
+      appendHeard: boolean
+      /** Where each transcript block already made a row stands, as seenReminders keys them. */
+      seenBlocks: string[]
     }
   }
 }

@@ -415,3 +415,65 @@ test('reminders a request carries become rows, each once, CLAUDE.md as sent', as
   expect(await ui.find({ type: 'Text', text: /^- \/tmp\/CLAUDE\.md \(project instructions, checked into the codebase\)$/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('where no session.append came by, the rows are read from the transcript, each once', async ($, on) => {
+  bottoms(on)
+  const prompt = {
+    role: 'user',
+    content: [
+      { type: 'text', text: '<system-reminder>\nToday is 2026-10-23.\n</system-reminder>' },
+      { type: 'text', text: 'lint の残りを調べて' },
+    ],
+  }
+  const reply = {
+    role: 'assistant',
+    content: [
+      { type: 'thinking', thinking: 'まず設定を見る' },
+      { type: 'text', text: '設定ファイルを洗い出します。' },
+      { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls -la' } },
+    ],
+  }
+  const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'package.json' }] }
+  const answer = { role: 'assistant', content: [{ type: 'text', text: '残りはありません。' }] }
+  let conversation: unknown[] = [prompt]
+  on('session.messages', async () => ({ value: conversation as never }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'lint の残りを調べて', turnId: 't1' })
+  const step = async () => {
+    try {
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+      for await (const _ of stream);
+    } catch {}
+  }
+  await step()
+  conversation = [prompt, reply, result]
+  await step()
+  conversation = [prompt, reply, result, answer]
+  await step()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  for (const text of ['USER', 'THINKING', 'ASSISTANT', 'TOOL']) {
+    expect(await ui.find({ text: new RegExp(text) })).toBeDefined()
+  }
+  expect(await ui.findAll({ type: 'Text', text: /lint の残りを調べて/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /設定ファイルを洗い出します/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /残りはありません/ })).toHaveLength(1)
+  expect(await ui.find({ text: /Bash .*→ package\.json/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('once a session.append comes by, the transcript is left to it', async ($, on) => {
+  bottoms(on)
+  on('session.messages', async () => ({
+    value: [{ role: 'user', content: [{ type: 'text', text: 'lint の残りを調べて' }] }] as never,
+  }))
+  await playOneTurn($)
+  try {
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+    for await (const _ of stream);
+  } catch {}
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.findAll({ type: 'Text', text: /lint の残りを調べて/ })).toHaveLength(1)
+  await ui.unmount()
+})
