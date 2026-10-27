@@ -1,11 +1,19 @@
 {
   "name": "trajectory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A Hermes-style trajectory pane: every system, user, context, assistant and tool row of the session on one timeline, with a minimap and search",
   "types": "./types/index.d.ts",
   "author": {
     "name": "him0"
   },
   "repository": "https://github.com/him0/claude-trajectory",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "skipManagedHooks": {
+      "type": "boolean",
+      "title": "Skip hooks an organization passes over",
+      "description": "Leave prompt.compose, prompt.context and session.append unhooked: the pane reads the prompt, memory files and transcript instead. Turned on by itself where cc-plugin-sec-default is loaded.",
+      "default": false
+    }
+  }
 }

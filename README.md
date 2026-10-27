@@ -66,6 +66,7 @@ Keys, once the pane has focus (`ctrl+x tab`):
 - The `CONTEXT` row at turn 0 shows the CLAUDE.md files and rules the first user message carries, as sent.
 - Reminders the engine injects at request time (a nested CLAUDE.md or a path-scoped rule a Read brought, the date, listings) are read off each request before it is sent and get a `CONTEXT` row each, including those joined onto the end of a tool result.
 - Where an organization manages Claude Code, an installed plugin's `prompt.compose` and `prompt.context` hooks do not run: the system prompt is then composed when `/trajectory` opens the pane, and before any request is sent, the CLAUDE.md files `/context` lists are read from disk (as they are now, which may differ from what will be sent).
+- Where `cc-plugin-sec-default` is loaded, the `skipManagedHooks` option (`/config`) turns itself on at session start, and the mod reloads without hooks on `prompt.compose`, `prompt.context` and `session.append`; the pane then reads the prompt, the memory files and the transcript as above. Turn it off by hand where that plugin is gone.
 - The last 1000 rows are kept; each row's text up to 20,000 characters (80,000 for the system prompt).
 - Token counts in the detail header are a local estimate (about 4 ASCII characters, or 1 other character, per token).
 - `/clear` starts the timeline over.

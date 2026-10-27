@@ -66,6 +66,11 @@ const seenReminders = atom({ plugin: 'trajectory', key: 'seenReminders' } as con
 const appendHeard = atom({ plugin: 'trajectory', key: 'appendHeard' } as const, false)
 // The transcript blocks already made rows, keyed as the reminders are.
 const seenBlocks = atom({ plugin: 'trajectory', key: 'seenBlocks' } as const, [] as string[])
+// The organization plugin that sends prompt.compose, prompt.context and
+// session.append on past the plugins a person installs.
+const PASSER = 'cc-plugin-sec-default'
+// Whether this load has it among the plugins: engine.create reads it.
+let passesOver = false
 
 const COLORS: Record<TrajectoryKind, ThemeKey> = {
   system: 'inactive',
@@ -550,8 +555,23 @@ const clockOf = (ms: number) => {
   return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  // Where an organization's plugin sends these events on past this mod, its
+  // hooks on them are left out, and the pane reads what they would bring.
+  const passedOverSkipped = options.skipManagedHooks === true
+
+  on('engine.create', async ($, e, next) => {
+    // The whole set at a load, this plugin alone at its reload.
+    passesOver = e.plugins.includes(PASSER)
+
+    return next(e)
+  })
+
   on('session.start', async ($, e, next) => {
+    // A change of the option reloads this module with the hooks left out.
+    if (passesOver && !passedOverSkipped) {
+      await $.config.set({ key: 'trajectory.skipManagedHooks', value: true }).catch(() => undefined)
+    }
     await $.command.register({
       name: 'trajectory',
       description: 'Show the trajectory of this session (every prompt, context, reply and tool call) in a pane',
@@ -588,19 +608,21 @@ export const register: Register = on => {
     return { text: 'Trajectory pane opened.' }
   })
 
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    await recordSystemPrompt($, composed.sections, e.model)
+  if (!passedOverSkipped) {
+    on('prompt.compose', async ($, e, next) => {
+      const composed = await next(e)
+      await recordSystemPrompt($, composed.sections, e.model)
 
-    return composed
-  })
+      return composed
+    })
 
-  on('prompt.context', async ($, e, next) => {
-    const result = await next(e)
-    await recordUserContext($, contextOfBlocks(result.blocks, result.instructionFiles ?? e.instructionFiles))
+    on('prompt.context', async ($, e, next) => {
+      const result = await next(e)
+      await recordUserContext($, contextOfBlocks(result.blocks, result.instructionFiles ?? e.instructionFiles))
 
-    return result
-  })
+      return result
+    })
+  }
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -660,79 +682,81 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.append', async ($, e, next) => {
-    if (e.agentId === undefined && !(await read($, appendHeard))) await update($, appendHeard, () => true)
-    const stored = await next(e)
-    if (e.agentId !== undefined || e.door === 'queue' || stored.deny !== undefined) return stored
+  if (!passedOverSkipped) {
+    on('session.append', async ($, e, next) => {
+      if (e.agentId === undefined && !(await read($, appendHeard))) await update($, appendHeard, () => true)
+      const stored = await next(e)
+      if (e.agentId !== undefined || e.door === 'queue' || stored.deny !== undefined) return stored
 
-    const { message } = stored
-    const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
-    const base = {
-      turn: turns,
-      at,
-      role: message.role ?? ('none' as const),
-      source: message.name ? `${e.door}:${message.name}` : e.door,
-    }
-    const blocks = message.content as Block[]
+      const { message } = stored
+      const [{ turns }, at] = await Promise.all([read($, meta), $.clock.now()])
+      const base = {
+        turn: turns,
+        at,
+        role: message.role ?? ('none' as const),
+        source: message.name ? `${e.door}:${message.name}` : e.door,
+      }
+      const blocks = message.content as Block[]
 
-    if (e.door === 'tool-result') {
-      const results = blocks.filter(b => b.type === 'tool_result')
-      if (results.length > 0) {
-        const byId = new Map(results.map(b => [String(b.tool_use_id), b]))
-        await update($, rows, list =>
-          list.map(row => {
-            const b = byId.get(row.id)
-            if (!b) return row
+      if (e.door === 'tool-result') {
+        const results = blocks.filter(b => b.type === 'tool_result')
+        if (results.length > 0) {
+          const byId = new Map(results.map(b => [String(b.tool_use_id), b]))
+          await update($, rows, list =>
+            list.map(row => {
+              const b = byId.get(row.id)
+              if (!b) return row
 
-            return {
-              ...row,
-              endAt: row.endAt ?? at,
-              result: clip(textOf(b.content)),
-              isError: b.is_error === true,
-            }
-          }),
-        )
+              return {
+                ...row,
+                endAt: row.endAt ?? at,
+                result: clip(textOf(b.content)),
+                isError: b.is_error === true,
+              }
+            }),
+          )
+
+          return stored
+        }
+      }
+
+      if (message.type === 'assistant') {
+        const added: TrajectoryRow[] = []
+        blocks.forEach((b, i) => {
+          if (b.type === 'text' && String(b.text ?? '').trim() !== '') {
+            added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'assistant', text: clip(String(b.text)) })
+          } else if (b.type === 'thinking' && String(b.thinking ?? '').trim() !== '') {
+            added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'thinking', text: clip(String(b.thinking)) })
+          } else if (b.type === 'tool_use') {
+            added.push({
+              ...base,
+              id: String(b.id),
+              kind: 'tool',
+              tool: String(b.name),
+              text: clip(JSON.stringify(b.input ?? {})),
+            })
+          }
+        })
+        await push($, added)
 
         return stored
       }
-    }
 
-    if (message.type === 'assistant') {
-      const added: TrajectoryRow[] = []
-      blocks.forEach((b, i) => {
-        if (b.type === 'text' && String(b.text ?? '').trim() !== '') {
-          added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'assistant', text: clip(String(b.text)) })
-        } else if (b.type === 'thinking' && String(b.thinking ?? '').trim() !== '') {
-          added.push({ ...base, id: `${stored.uuid}:${i}`, kind: 'thinking', text: clip(String(b.thinking)) })
-        } else if (b.type === 'tool_use') {
-          added.push({
-            ...base,
-            id: String(b.id),
-            kind: 'tool',
-            tool: String(b.name),
-            text: clip(JSON.stringify(b.input ?? {})),
-          })
-        }
-      })
-      await push($, added)
+      const text = textOf(message.content)
+      if (text.trim() === '') return stored
+
+      const isUser = (e.door === 'prompt' || e.door === 'command') && message.isMeta !== true
+      const kind: TrajectoryKind = isUser
+        ? 'user'
+        : e.door === 'notice' || e.door === 'compaction'
+          ? 'system'
+          : 'context'
+      const label = message.name && !isUser ? `[${message.name}] ` : ''
+      await push($, [{ ...base, id: stored.uuid, kind, text: clip(label + text) }])
 
       return stored
-    }
-
-    const text = textOf(message.content)
-    if (text.trim() === '') return stored
-
-    const isUser = (e.door === 'prompt' || e.door === 'command') && message.isMeta !== true
-    const kind: TrajectoryKind = isUser
-      ? 'user'
-      : e.door === 'notice' || e.door === 'compaction'
-        ? 'system'
-        : 'context'
-    const label = message.name && !isUser ? `[${message.name}] ` : ''
-    await push($, [{ ...base, id: stored.uuid, kind, text: clip(label + text) }])
-
-    return stored
-  })
+    })
+  }
 
   on('tool.call', async ($, e, next) => {
     const startAt = await $.clock.now()

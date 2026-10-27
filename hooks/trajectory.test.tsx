@@ -477,3 +477,51 @@ test('once a session.append comes by, the transcript is left to it', async ($, o
   expect(await ui.findAll({ type: 'Text', text: /lint の残りを調べて/ })).toHaveLength(1)
   await ui.unmount()
 })
+
+test('where cc-plugin-sec-default is loaded, the option to skip its events is turned on', {
+  plugins: [{ name: 'cc-plugin-sec-default', tier: 'prepend', register: () => undefined }],
+}, async ($, on) => {
+  bottoms(on)
+  const set: unknown[] = []
+  on('config.set', async ($, e) => (set.push({ key: e.key, value: e.value }), { value: e.value }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  expect(set).toEqual([{ key: 'trajectory.skipManagedHooks', value: true }])
+})
+
+test('elsewhere the option is left as it is', async ($, on) => {
+  bottoms(on)
+  const set: unknown[] = []
+  on('config.set', async ($, e) => (set.push(e.key), { value: e.value }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  expect(set).toEqual([])
+})
+
+test('with the option on, prompt.compose is left unhooked', { options: { skipManagedHooks: true } }, async ($, on) => {
+  bottoms(on)
+  composesOnce(on)
+  await $.prompt.compose(COMPOSE)
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /Initial System Prompt · 1 sections/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('with the option on, the turn is still read from the transcript', { options: { skipManagedHooks: true } }, async ($, on) => {
+  bottoms(on)
+  on('session.messages', async () => ({
+    value: [{ role: 'user', content: [{ type: 'text', text: 'lint の残りを調べて' }] }] as never,
+  }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'lint の残りを調べて', turnId: 't1' })
+  try {
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+    for await (const _ of stream);
+  } catch {}
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.findAll({ type: 'Text', text: /lint の残りを調べて/ })).toHaveLength(1)
+  await ui.unmount()
+})
